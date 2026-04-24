@@ -1,103 +1,215 @@
-name: Wiz Container Security Scan
+# ════════════════════════════════════════════════════════════════════════════════
+# Wiz Container Security Pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+# Focus: Container image scanning → SARIF upload to GitHub Security tab
+# Also runs: SCA + IaC scans (results in CI logs + Job Summary only)
+#
+# SARIF lifecycle:
+#   • Only container image findings go to GitHub Security (category: wiz-image)
+#   • Same category per push = GitHub auto-closes stale, opens new
+#   • SCA/IaC/Layer details visible in Job Summary + CI logs
+# ════════════════════════════════════════════════════════════════════════════════
+name: "[Wiz Cloud] Container Security Scan"
 
 on:
   push:
-    branches: ["main", "master", "feature/**", "hotfix/**", "release/**"]
-    paths-ignore:
-      - "**/*.md"
-      - "**/*.txt"
+    branches: [main]
   pull_request:
-    branches: ["main", "master"]
+  workflow_dispatch:
 
-permissions:
-  contents: read
-  security-events: write
-  actions: read
-
-env:
-  IMAGE_NAME: wiz-node-container-demo
-  IMAGE_TAG: ${{ github.sha }}
+concurrency:
+  group: wiz-scan-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   wiz-container-scan:
-    name: Build, Scan & Upload SARIF
+    name: "Wiz — Container Security Scan"
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents:        read
+      security-events: write
+      actions:         read
+
+    env:
+      IMAGE_TAG:      "wiz-container-scanning:${{ github.sha }}"
+      POLICY:         "Default vulnerabilities policy"
+      GITHUB_RUN_URL: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      COLUMNS:        "250"
+      TERM:           "xterm-256color"
 
     steps:
-      # ── 1. Checkout ───────────────────────────────────────────────────────
-      - name: Checkout code
+
+      # ── SETUP ───────────────────────────────────────────────────────────────
+
+      - name: "[Setup] Checkout"
         uses: actions/checkout@v4
 
-      # ── 2. Build Docker image ────────────────────────────────────────────
-      - name: Build Docker image
+      - name: "[Setup] Install Wiz CLI v1"
+        timeout-minutes: 3
         run: |
-          docker build -t ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} .
-          echo "✔ Image built: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
-
-      # ── 3. Install Wiz CLI ───────────────────────────────────────────────
-      - name: Install Wiz CLI
-        run: |
-          curl -sLo wizcli https://wizcli.app.wiz.io/latest/wizcli-linux-amd64
-          chmod +x wizcli
-          sudo mv wizcli /usr/local/bin/wizcli
+          curl -fsSL -o /tmp/wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64
+          chmod +x /tmp/wizcli
+          sudo mv /tmp/wizcli /usr/local/bin/wizcli
           wizcli version
 
-      # ── 4. Authenticate with Wiz ─────────────────────────────────────────
-      - name: Authenticate with Wiz
-        run: |
-          wizcli auth --id "${{ secrets.WIZ_CLIENT_ID }}" --secret "${{ secrets.WIZ_CLIENT_SECRET }}"
+      - name: "[Setup] Authenticate"
+        timeout-minutes: 2
         env:
-          WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_ID:     ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
-
-      # ── 5. Scan Docker image with Wiz ────────────────────────────────────
-      - name: Wiz Docker image scan
-        id: wiz_scan
         run: |
-          wizcli docker scan \
-            --image "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" \
-            --output image.sarif,sarif,true \
-            --policy-hits-only \
-            || true
-          echo "✔ Wiz scan complete"
-          ls -la image.sarif 2>/dev/null && echo "SARIF file generated" || echo "⚠ No SARIF output"
+          wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
+          echo "::notice title=Wiz Auth::Authentication successful"
 
-      # ── 6. Parse & enrich SARIF (PS1 parser) ─────────────────────────────
-      - name: Enrich SARIF with security-severity scores
-        if: always()
+      # ── BUILD ───────────────────────────────────────────────────────────────
+
+      - name: "[Build] Docker image"
+        timeout-minutes: 10
+        run: |
+          docker build --tag "$IMAGE_TAG" .
+          echo "::notice title=Docker Build::Built $IMAGE_TAG successfully"
+
+      # ── CONTAINER IMAGE SCAN (→ SARIF upload) ──────────────────────────────
+
+      - name: "[Scan] Container Image — Per-Layer Vulnerability Scan"
+        id:   container_scan
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          WIZ_CLIENT_ID:     ${{ secrets.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+        run: |
+          sudo -E $(which wizcli) auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
+
+          CONTAINER_EXIT=0
+          sudo -E $(which wizcli) docker scan \
+            --image    "$IMAGE_TAG" \
+            --policies "$POLICY" \
+            --driver   mountWithLayers \
+            --output   image.sarif,sarif,vulnerabilities \
+            --output   image.txt,human,vulnerabilities \
+            --output   image-layers.json,json,vulnerabilities || CONTAINER_EXIT=$?
+
+          sudo chown runner:runner image.sarif image.txt image-layers.json 2>/dev/null || true
+
+          echo "::group::Container scan output"
+          cat image.txt 2>/dev/null || echo "(no text output)"
+          echo "::endgroup::"
+
+          ls -lh image.sarif image-layers.json 2>/dev/null || true
+
+          if [ -f image.sarif ]; then
+            RESULTS=$(python3 -c "import json; d=json.load(open('image.sarif')); print(sum(len(r.get('results',[])) for r in d.get('runs',[])))" 2>/dev/null || echo "?")
+            echo "::notice title=Container Scan::$RESULTS findings in image.sarif ($(wc -c < image.sarif) bytes)"
+          fi
+
+          if [ "$CONTAINER_EXIT" -ne 0 ] && [ "$CONTAINER_EXIT" -ne 4 ]; then
+            echo "::error title=Container Scan::Unexpected exit code $CONTAINER_EXIT"
+            exit "$CONTAINER_EXIT"
+          fi
+
+      # ── SCA SCAN (logs + summary only, no SARIF upload) ────────────────────
+
+      - name: "[Scan] SCA — Source Dependencies (log-only)"
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          SCA_EXIT=0
+          wizcli dir scan \
+            --path . \
+            --output dir.sarif,sarif,vulnerabilities \
+            --output dir.txt,human,vulnerabilities || SCA_EXIT=$?
+
+          echo "::group::SCA scan output"
+          cat dir.txt 2>/dev/null || echo "(no text output)"
+          echo "::endgroup::"
+
+          if [ -f dir.sarif ]; then
+            RESULTS=$(python3 -c "import json; d=json.load(open('dir.sarif')); print(sum(len(r.get('results',[])) for r in d.get('runs',[])))" 2>/dev/null || echo "?")
+            echo "::notice title=SCA Scan::$RESULTS findings (log-only, not uploaded to Security tab)"
+          fi
+
+      # ── IaC SCAN (logs + summary only, no SARIF upload) ────────────────────
+
+      - name: "[Scan] IaC — Dockerfile Linting (log-only)"
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          IAC_EXIT=0
+          wizcli iac scan \
+            --path ./Dockerfile \
+            --output dockerfile.sarif,sarif,misconfigurations \
+            --output dockerfile.txt,human,misconfigurations || IAC_EXIT=$?
+
+          echo "::group::IaC scan output"
+          cat dockerfile.txt 2>/dev/null || echo "(no text output)"
+          echo "::endgroup::"
+
+          if [ -f dockerfile.sarif ]; then
+            RESULTS=$(python3 -c "import json; d=json.load(open('dockerfile.sarif')); print(sum(len(r.get('results',[])) for r in d.get('runs',[])))" 2>/dev/null || echo "?")
+            echo "::notice title=IaC Scan::$RESULTS findings (log-only, not uploaded to Security tab)"
+          fi
+
+      # ── REPORT — Enrich image.sarif + print all results ────────────────────
+
+      - name: "[Report] Enrich & Print Security Reports"
+        if:   always()
         shell: pwsh
+        timeout-minutes: 5
         run: |
-          ./scripts/parse_wiz_image_scan.ps1 `
-            -ImageSarifPath "image.sarif" `
-            -SummaryMarkdownPath "wiz-summary.md"
+          Write-Host "::group::Input file inventory"
+          @("image.sarif","image-layers.json","dir.sarif","dockerfile.sarif") | ForEach-Object {
+            $exists = Test-Path -LiteralPath $_
+            $status = $exists ? "FOUND" : "NOT FOUND — skipping"
+            Write-Host ("  {0,-30} {1}" -f $_, $status)
+          }
+          Write-Host "::endgroup::"
 
-      # ── 7. Write Job Summary ──────────────────────────────────────────────
-      - name: Write GitHub Job Summary
-        if: always()
+          ./scripts/parse_wiz_image_scan.ps1 `
+            -ImageSarifPath      image.sarif `
+            -ImageLayersPath     image-layers.json `
+            -DirSarifPath        dir.sarif `
+            -DockerfileSarifPath dockerfile.sarif `
+            -SummaryMarkdownPath wiz-summary.md `
+            -GitHubRunUrl        "${{ env.GITHUB_RUN_URL }}"
+
+      # ── PUBLISH JOB SUMMARY ─────────────────────────────────────────────────
+
+      - name: "[Report] Publish Job Summary"
+        if:   always()
         run: |
           if [ -f wiz-summary.md ]; then
             cat wiz-summary.md >> "$GITHUB_STEP_SUMMARY"
-            echo "✔ Job summary written"
-          else
-            echo "⚠ No summary file found" >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=Job Summary::Wiz security summary published — view Summary tab"
           fi
 
-      # ── 8. Upload enriched SARIF to GitHub Code Scanning ─────────────────
-      - name: Upload SARIF to GitHub Security
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: image.sarif
-          category: "wiz-container-scan"
-        continue-on-error: true
+      # ── ARTIFACTS ───────────────────────────────────────────────────────────
 
-      # ── 9. Upload SARIF as build artifact ────────────────────────────────
-      - name: Upload scan artifacts
-        if: always()
+      - name: "[Artifacts] Archive Scan Outputs"
+        if:   always()
         uses: actions/upload-artifact@v4
         with:
-          name: wiz-scan-results
+          name:              "wiz-security-scan-${{ github.run_id }}"
+          retention-days:    30
+          if-no-files-found: warn
           path: |
-            image.sarif
             wiz-summary.md
-          retention-days: 30
+            image.sarif
+            image.txt
+            image-layers.json
+            dir.sarif
+            dir.txt
+            dockerfile.sarif
+            dockerfile.txt
+
+      # ── SARIF UPLOAD — Container Image only ─────────────────────────────────
+
+      - name: "[SARIF] Upload Container Image Results (category: wiz-image)"
+        if:   always() && hashFiles('image.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file:          image.sarif
+          category:            wiz-image
+          wait-for-processing: true

@@ -1,0 +1,271 @@
+# ════════════════════════════════════════════════════════════════════════════════
+# Prisma vs Wiz — Container Scan Comparison
+# ─────────────────────────────────────────────────────────────────────────────
+# Runs BOTH Prisma Cloud (twistcli) and Wiz CLI against the same Docker image.
+# No SARIF upload — results are in CI logs + Job Summary only.
+# Purpose: Compare scanner output, finding counts, and coverage.
+# ════════════════════════════════════════════════════════════════════════════════
+name: "[Compare] Prisma vs Wiz Container Scan"
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: compare-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare-scans:
+    name: "Prisma vs Wiz — Side-by-Side Scan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      actions:  read
+
+    env:
+      IMAGE_TAG: "wiz-container-scanning:${{ github.sha }}"
+      COLUMNS:   "250"
+      TERM:      "xterm-256color"
+
+    steps:
+
+      # ── SETUP ───────────────────────────────────────────────────────────────
+
+      - name: "[Setup] Checkout"
+        uses: actions/checkout@v4
+
+      # ── BUILD (shared image for both scanners) ─────────────────────────────
+
+      - name: "[Build] Docker image"
+        timeout-minutes: 10
+        run: |
+          docker build --tag "$IMAGE_TAG" .
+          echo "::notice title=Docker Build::Built $IMAGE_TAG"
+
+      # ══════════════════════════════════════════════════════════════════════════
+      # PRISMA CLOUD SCAN
+      # ══════════════════════════════════════════════════════════════════════════
+
+      - name: "[Prisma] Download twistcli"
+        timeout-minutes: 3
+        env:
+          PCC_USER: ${{ secrets.PCC_USER }}
+          PCC_PASS: ${{ secrets.PCC_PASS }}
+        run: |
+          PCC_CONSOLE="https://asia-south1.cloud.twistlock.com/india-1131963775"
+          curl -fsSL \
+            -u "$PCC_USER:$PCC_PASS" \
+            -o /tmp/twistcli \
+            "${PCC_CONSOLE}/api/v1/util/twistcli"
+          chmod +x /tmp/twistcli
+          sudo mv /tmp/twistcli /usr/local/bin/twistcli
+          twistcli --version || echo "twistcli installed"
+
+      - name: "[Prisma] Scan Container Image"
+        id:   prisma_scan
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          PCC_USER: ${{ secrets.PCC_USER }}
+          PCC_PASS: ${{ secrets.PCC_PASS }}
+        run: |
+          PCC_CONSOLE="https://asia-south1.cloud.twistlock.com/india-1131963775"
+          PRISMA_EXIT=0
+          twistcli images scan \
+            --address "$PCC_CONSOLE" \
+            --user "$PCC_USER" \
+            --password "$PCC_PASS" \
+            --output-file prisma_results.json \
+            --details \
+            "$IMAGE_TAG" || PRISMA_EXIT=$?
+
+          echo "prisma_exit=$PRISMA_EXIT" >> "$GITHUB_OUTPUT"
+
+          echo "::group::Prisma Cloud scan output"
+          cat prisma_results.json 2>/dev/null | python3 -m json.tool 2>/dev/null | head -200 || echo "(no JSON output)"
+          echo "::endgroup::"
+
+          if [ -f prisma_results.json ]; then
+            echo "::notice title=Prisma Scan::Scan complete (exit $PRISMA_EXIT), results saved"
+          else
+            echo "::warning title=Prisma Scan::No output file generated (exit $PRISMA_EXIT)"
+          fi
+
+      # ══════════════════════════════════════════════════════════════════════════
+      # WIZ SCAN
+      # ══════════════════════════════════════════════════════════════════════════
+
+      - name: "[Wiz] Install CLI v1"
+        timeout-minutes: 3
+        run: |
+          curl -fsSL -o /tmp/wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64
+          chmod +x /tmp/wizcli
+          sudo mv /tmp/wizcli /usr/local/bin/wizcli
+          wizcli version
+
+      - name: "[Wiz] Authenticate"
+        timeout-minutes: 2
+        env:
+          WIZ_CLIENT_ID:     ${{ secrets.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+        run: |
+          wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
+
+      - name: "[Wiz] Scan Container Image"
+        id:   wiz_scan
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          WIZ_CLIENT_ID:     ${{ secrets.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+        run: |
+          sudo -E $(which wizcli) auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
+
+          WIZ_EXIT=0
+          sudo -E $(which wizcli) docker scan \
+            --image  "$IMAGE_TAG" \
+            --driver mountWithLayers \
+            --output wiz_image.sarif,sarif,vulnerabilities \
+            --output wiz_image.txt,human,vulnerabilities || WIZ_EXIT=$?
+
+          sudo chown runner:runner wiz_image.sarif wiz_image.txt 2>/dev/null || true
+
+          echo "wiz_exit=$WIZ_EXIT" >> "$GITHUB_OUTPUT"
+
+          echo "::group::Wiz scan output"
+          cat wiz_image.txt 2>/dev/null || echo "(no text output)"
+          echo "::endgroup::"
+
+          if [ -f wiz_image.sarif ]; then
+            RESULTS=$(python3 -c "import json; d=json.load(open('wiz_image.sarif')); print(sum(len(r.get('results',[])) for r in d.get('runs',[])))" 2>/dev/null || echo "?")
+            echo "::notice title=Wiz Scan::$RESULTS findings in SARIF (exit $WIZ_EXIT)"
+          fi
+
+      # ══════════════════════════════════════════════════════════════════════════
+      # COMPARISON REPORT
+      # ══════════════════════════════════════════════════════════════════════════
+
+      - name: "[Compare] Generate Comparison Summary"
+        if: always()
+        run: |
+          echo "# Prisma vs Wiz — Container Scan Comparison" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Image:** \`$IMAGE_TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # ── Wiz stats ──
+          WIZ_TOTAL="N/A"; WIZ_CRIT="0"; WIZ_HIGH="0"; WIZ_MED="0"; WIZ_LOW="0"
+          if [ -f wiz_image.sarif ]; then
+            WIZ_TOTAL=$(python3 -c "
+          import json
+          d=json.load(open('wiz_image.sarif'))
+          results=[r for run in d.get('runs',[]) for r in run.get('results',[])]
+          print(len(results))
+          " 2>/dev/null || echo "?")
+
+            python3 -c "
+          import json
+          d=json.load(open('wiz_image.sarif'))
+          results=[r for run in d.get('runs',[]) for r in run.get('results',[])]
+          sevs={}
+          for r in results:
+              msg=r.get('message',{}).get('text','')
+              sev='UNKNOWN'
+              for line in msg.split('\n'):
+                  if line.strip().lower().startswith('severity:'):
+                      sev=line.split(':',1)[1].strip().upper()
+                      break
+              if sev not in sevs: sevs[sev]=0
+              sevs[sev]+=1
+          for s in ['CRITICAL','HIGH','MEDIUM','LOW','INFORMATIONAL','UNKNOWN']:
+              print(f'{s}={sevs.get(s,0)}')
+          " 2>/dev/null > /tmp/wiz_sevs.txt || true
+
+            while IFS='=' read -r key val; do
+              case "$key" in
+                CRITICAL) WIZ_CRIT="$val" ;;
+                HIGH)     WIZ_HIGH="$val" ;;
+                MEDIUM)   WIZ_MED="$val" ;;
+                LOW)      WIZ_LOW="$val" ;;
+              esac
+            done < /tmp/wiz_sevs.txt 2>/dev/null || true
+          fi
+
+          # ── Prisma stats (best-effort from JSON) ──
+          PRISMA_TOTAL="N/A"; PRISMA_CRIT="0"; PRISMA_HIGH="0"; PRISMA_MED="0"; PRISMA_LOW="0"
+          if [ -f prisma_results.json ]; then
+            python3 -c "
+          import json
+          d=json.load(open('prisma_results.json'))
+          # Prisma twistcli JSON varies — try common structures
+          vulns=[]
+          if isinstance(d, list):
+              for item in d:
+                  vulns.extend(item.get('vulnerabilities',[]))
+          elif isinstance(d, dict):
+              for r in d.get('results',[]):
+                  vulns.extend(r.get('vulnerabilities',[]))
+              if not vulns:
+                  vulns=d.get('vulnerabilities',[])
+          sevs={}
+          for v in vulns:
+              s=v.get('severity','unknown').upper()
+              if s not in sevs: sevs[s]=0
+              sevs[s]+=1
+          print(f'TOTAL={len(vulns)}')
+          for s in ['CRITICAL','HIGH','MEDIUM','LOW']:
+              print(f'{s}={sevs.get(s,0)}')
+          " 2>/dev/null > /tmp/prisma_sevs.txt || true
+
+            while IFS='=' read -r key val; do
+              case "$key" in
+                TOTAL)    PRISMA_TOTAL="$val" ;;
+                CRITICAL) PRISMA_CRIT="$val" ;;
+                HIGH)     PRISMA_HIGH="$val" ;;
+                MEDIUM)   PRISMA_MED="$val" ;;
+                LOW)      PRISMA_LOW="$val" ;;
+              esac
+            done < /tmp/prisma_sevs.txt 2>/dev/null || true
+          fi
+
+          # ── Write comparison table ──
+          echo "## Scan Results Comparison" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Prisma Cloud | Wiz |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---:|---:|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Total Findings | $PRISMA_TOTAL | $WIZ_TOTAL |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🔴 Critical | $PRISMA_CRIT | $WIZ_CRIT |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🟠 High | $PRISMA_HIGH | $WIZ_HIGH |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🟡 Medium | $PRISMA_MED | $WIZ_MED |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🟢 Low | $PRISMA_LOW | $WIZ_LOW |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "## Scanner Details" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Feature | Prisma Cloud (twistcli) | Wiz CLI v1 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Scan Method | \`twistcli images scan\` | \`wizcli docker scan --driver mountWithLayers\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Per-Layer Breakdown | ❌ | ✅ |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| SCA (Source Deps) | Via separate scan | \`wizcli dir scan\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| IaC (Dockerfile) | ❌ | \`wizcli iac scan\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| SARIF Output | ✅ | ✅ |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| GitHub Security Upload | ✅ (\`upload-sarif\`) | ✅ (\`upload-sarif\`) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "---" >> "$GITHUB_STEP_SUMMARY"
+          echo "_Comparison run: $(date -u '+%Y-%m-%d %H:%M UTC')_" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── ARTIFACTS ───────────────────────────────────────────────────────────
+
+      - name: "[Artifacts] Archive All Scan Outputs"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "scan-comparison-${{ github.run_id }}"
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            prisma_results.json
+            wiz_image.sarif
+            wiz_image.txt
