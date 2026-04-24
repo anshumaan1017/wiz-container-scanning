@@ -135,6 +135,7 @@ jobs:
             --image  "$IMAGE_TAG" \
             --policies "Zee-Container-Security" \
             --policy-hits-only \
+            --by-policy-hits=AUDIT \
             --output wiz_image.sarif,sarif,vulnerabilities \
             --output wiz_image.txt,human,vulnerabilities || WIZ_EXIT=$?
 

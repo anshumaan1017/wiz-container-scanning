@@ -34,7 +34,7 @@ jobs:
 
     env:
       IMAGE_TAG:      "wiz-container-scanning:${{ github.sha }}"
-      POLICY:         "Default vulnerabilities policy"
+      POLICY:         "Zee-Container-Security"
       GITHUB_RUN_URL: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
       COLUMNS:        "250"
       TERM:           "xterm-256color"
