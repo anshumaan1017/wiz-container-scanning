@@ -134,12 +134,11 @@ jobs:
           sudo -E $(which wizcli) docker scan \
             --image  "$IMAGE_TAG" \
             --policies "Zee-Container-Security" \
-            --policy-hits-only \
-            --by-policy-hits=AUDIT \
             --output wiz_image.sarif,sarif,vulnerabilities \
+            --output wiz_image.json,json,vulnerabilities \
             --output wiz_image.txt,human,vulnerabilities || WIZ_EXIT=$?
 
-          sudo chown runner:runner wiz_image.sarif wiz_image.txt 2>/dev/null || true
+          sudo chown runner:runner wiz_image.sarif wiz_image.json wiz_image.txt 2>/dev/null || true
 
           echo "wiz_exit=$WIZ_EXIT" >> "$GITHUB_OUTPUT"
 
@@ -147,9 +146,41 @@ jobs:
           cat wiz_image.txt 2>/dev/null || echo "(no text output)"
           echo "::endgroup::"
 
+          # Count ALL findings + filtered (Critical/High with fix only — matching Prisma)
           if [ -f wiz_image.sarif ]; then
             RESULTS=$(python3 -c "import json; d=json.load(open('wiz_image.sarif')); print(sum(len(r.get('results',[])) for r in d.get('runs',[])))" 2>/dev/null || echo "?")
-            echo "::notice title=Wiz Scan::$RESULTS findings in SARIF (exit $WIZ_EXIT)"
+            echo "::notice title=Wiz Scan (all)::$RESULTS total findings in SARIF (exit $WIZ_EXIT)"
+          fi
+
+          # Filter Wiz JSON to match Prisma behavior: only Critical+High with a fix
+          if [ -f wiz_image.json ]; then
+            python3 << 'PYEOF' > /tmp/wiz_filtered.txt 2>/dev/null || true
+          import json
+          d=json.load(open('wiz_image.json'))
+          vulns=d.get('result',{}).get('vulnerabilities',[])
+          if not vulns:
+            for k in d:
+              if isinstance(d[k], dict):
+                vulns=d[k].get('vulnerabilities',[])
+                if vulns: break
+              elif isinstance(d[k], list):
+                vulns=d[k]
+                break
+          filtered=[v for v in vulns if v.get('severity','').upper() in ('CRITICAL','HIGH') and v.get('fixedVersion','') not in ('',None,'N/A')]
+          by_sev={}
+          for v in filtered:
+            s=v.get('severity','').upper()
+            by_sev[s]=by_sev.get(s,0)+1
+          print(f'FILTERED_TOTAL={len(filtered)}')
+          print(f'FILTERED_CRITICAL={by_sev.get("CRITICAL",0)}')
+          print(f'FILTERED_HIGH={by_sev.get("HIGH",0)}')
+          print(f'ALL_TOTAL={len(vulns)}')
+          PYEOF
+
+            while IFS='=' read -r key val; do
+              export "WIZ_$key=$val"
+            done < /tmp/wiz_filtered.txt 2>/dev/null || true
+            echo "::notice title=Wiz Scan (filtered)::${WIZ_FILTERED_TOTAL:-?} fixable Critical+High out of ${WIZ_ALL_TOTAL:-?} total"
           fi
 
       # ══════════════════════════════════════════════════════════════════════════
@@ -235,8 +266,42 @@ jobs:
             done < /tmp/prisma_sevs.txt 2>/dev/null || true
           fi
 
+          # ── Wiz filtered stats (Critical+High with fix — Prisma-comparable) ──
+          WIZ_FILT_TOTAL="N/A"; WIZ_FILT_CRIT="0"; WIZ_FILT_HIGH="0"
+          if [ -f wiz_image.json ]; then
+            python3 << 'PYEOF' > /tmp/wiz_filt.txt 2>/dev/null || true
+          import json
+          d=json.load(open('wiz_image.json'))
+          vulns=d.get('result',{}).get('vulnerabilities',[])
+          if not vulns:
+            for k in d:
+              if isinstance(d[k], dict):
+                vulns=d[k].get('vulnerabilities',[])
+                if vulns: break
+              elif isinstance(d[k], list):
+                vulns=d[k]
+                break
+          filtered=[v for v in vulns if v.get('severity','').upper() in ('CRITICAL','HIGH') and v.get('fixedVersion','') not in ('',None,'N/A')]
+          by_sev={}
+          for v in filtered:
+            s=v.get('severity','').upper()
+            by_sev[s]=by_sev.get(s,0)+1
+          print(f'TOTAL={len(filtered)}')
+          print(f'CRITICAL={by_sev.get("CRITICAL",0)}')
+          print(f'HIGH={by_sev.get("HIGH",0)}')
+          PYEOF
+
+            while IFS='=' read -r key val; do
+              case "$key" in
+                TOTAL)    WIZ_FILT_TOTAL="$val" ;;
+                CRITICAL) WIZ_FILT_CRIT="$val" ;;
+                HIGH)     WIZ_FILT_HIGH="$val" ;;
+              esac
+            done < /tmp/wiz_filt.txt 2>/dev/null || true
+          fi
+
           # ── Write comparison table ──
-          echo "## Scan Results Comparison" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Scan Results — All Findings" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Metric | Prisma Cloud | Wiz |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---:|---:|" >> "$GITHUB_STEP_SUMMARY"
@@ -245,6 +310,17 @@ jobs:
           echo "| 🟠 High | $PRISMA_HIGH | $WIZ_HIGH |" >> "$GITHUB_STEP_SUMMARY"
           echo "| 🟡 Medium | $PRISMA_MED | $WIZ_MED |" >> "$GITHUB_STEP_SUMMARY"
           echo "| 🟢 Low | $PRISMA_LOW | $WIZ_LOW |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "## Apples-to-Apples — Critical+High with Fix Available" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "> Prisma only reports fixable CVEs by default. This table filters Wiz to match." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Prisma Cloud | Wiz (filtered) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---:|---:|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🔴 Critical (fixable) | $PRISMA_CRIT | $WIZ_FILT_CRIT |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🟠 High (fixable) | $PRISMA_HIGH | $WIZ_FILT_HIGH |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Total (fixable Crit+High)** | **$(( ${PRISMA_CRIT:-0} + ${PRISMA_HIGH:-0} ))** | **$WIZ_FILT_TOTAL** |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
           echo "## Scanner Details" >> "$GITHUB_STEP_SUMMARY"
@@ -272,4 +348,5 @@ jobs:
           path: |
             prisma_results.json
             wiz_image.sarif
+            wiz_image.json
             wiz_image.txt
