@@ -77,10 +77,10 @@ jobs:
               for pkg in (result.get(pkg_type, []) or []):
                   for v in (pkg.get('vulnerabilities', []) or []):
                       all_vulns.append(v)
-                      if v.get('hasExploit'):
+                      if v.get('hasExploit') and v.get('fixedVersion') not in (None, ''):
                           exploitable.append(v)
 
-          # Only count exploitable CVEs
+          # Only count exploitable + fixable CVEs
           sevs = {}
           for v in exploitable:
               s = v.get('severity','UNKNOWN').upper()
@@ -116,9 +116,9 @@ jobs:
             echo ""
             echo "**Image:** \`$IMAGE_TAG\`"
             echo "**Wiz Policy:** \`Zee-Container-Security\`"
-            echo "**Wiz Filter:** 💥 Public Exploit only (\`hasExploit=true\`)"
+            echo "**Wiz Filter:** 💥 Public Exploit + Has Fix"
             echo ""
-            echo "> Prisma shows all findings. Wiz shows only CVEs with a **known public exploit**."
+            echo "> Prisma shows all findings. Wiz shows only CVEs with a **public exploit AND a fix available**."
             echo "> Wiz scanned $W_ALL total CVEs; $W_TOTAL have a public exploit."
             echo ""
             echo "| Severity | Prisma (all) | Wiz (💥 exploit only) |"
