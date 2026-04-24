@@ -133,6 +133,8 @@ jobs:
           WIZ_EXIT=0
           sudo -E $(which wizcli) docker scan \
             --image  "$IMAGE_TAG" \
+            --policies "Zee-Container-Security" \
+            --policy-hits-only \
             --output wiz_image.sarif,sarif,vulnerabilities \
             --output wiz_image.txt,human,vulnerabilities || WIZ_EXIT=$?
 
