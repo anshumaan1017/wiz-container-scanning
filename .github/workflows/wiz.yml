@@ -1,0 +1,103 @@
+name: Wiz Container Security Scan
+
+on:
+  push:
+    branches: ["main", "master", "feature/**", "hotfix/**", "release/**"]
+    paths-ignore:
+      - "**/*.md"
+      - "**/*.txt"
+  pull_request:
+    branches: ["main", "master"]
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+env:
+  IMAGE_NAME: wiz-node-container-demo
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  wiz-container-scan:
+    name: Build, Scan & Upload SARIF
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── 2. Build Docker image ────────────────────────────────────────────
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} .
+          echo "✔ Image built: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+
+      # ── 3. Install Wiz CLI ───────────────────────────────────────────────
+      - name: Install Wiz CLI
+        run: |
+          curl -sLo wizcli https://wizcli.app.wiz.io/latest/wizcli-linux-amd64
+          chmod +x wizcli
+          sudo mv wizcli /usr/local/bin/wizcli
+          wizcli version
+
+      # ── 4. Authenticate with Wiz ─────────────────────────────────────────
+      - name: Authenticate with Wiz
+        run: |
+          wizcli auth --id "${{ secrets.WIZ_CLIENT_ID }}" --secret "${{ secrets.WIZ_CLIENT_SECRET }}"
+        env:
+          WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+
+      # ── 5. Scan Docker image with Wiz ────────────────────────────────────
+      - name: Wiz Docker image scan
+        id: wiz_scan
+        run: |
+          wizcli docker scan \
+            --image "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" \
+            --output image.sarif,sarif,true \
+            --policy-hits-only \
+            || true
+          echo "✔ Wiz scan complete"
+          ls -la image.sarif 2>/dev/null && echo "SARIF file generated" || echo "⚠ No SARIF output"
+
+      # ── 6. Parse & enrich SARIF (PS1 parser) ─────────────────────────────
+      - name: Enrich SARIF with security-severity scores
+        if: always()
+        shell: pwsh
+        run: |
+          ./scripts/parse_wiz_image_scan.ps1 `
+            -ImageSarifPath "image.sarif" `
+            -SummaryMarkdownPath "wiz-summary.md"
+
+      # ── 7. Write Job Summary ──────────────────────────────────────────────
+      - name: Write GitHub Job Summary
+        if: always()
+        run: |
+          if [ -f wiz-summary.md ]; then
+            cat wiz-summary.md >> "$GITHUB_STEP_SUMMARY"
+            echo "✔ Job summary written"
+          else
+            echo "⚠ No summary file found" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ── 8. Upload enriched SARIF to GitHub Code Scanning ─────────────────
+      - name: Upload SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: image.sarif
+          category: "wiz-container-scan"
+        continue-on-error: true
+
+      # ── 9. Upload SARIF as build artifact ────────────────────────────────
+      - name: Upload scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wiz-scan-results
+          path: |
+            image.sarif
+            wiz-summary.md
+          retention-days: 30
