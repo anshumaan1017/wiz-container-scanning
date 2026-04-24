@@ -1,352 +1,135 @@
-# ════════════════════════════════════════════════════════════════════════════════
-# Prisma vs Wiz — Container Scan Comparison
-# ─────────────────────────────────────────────────────────────────────────────
-# Runs BOTH Prisma Cloud (twistcli) and Wiz CLI against the same Docker image.
-# No SARIF upload — results are in CI logs + Job Summary only.
-# Purpose: Compare scanner output, finding counts, and coverage.
-# ════════════════════════════════════════════════════════════════════════════════
 name: "[Compare] Prisma vs Wiz Container Scan"
-
 on:
   workflow_dispatch:
 
-concurrency:
-  group: compare-scan-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  compare-scans:
-    name: "Prisma vs Wiz — Side-by-Side Scan"
+  compare:
+    name: "Prisma vs Wiz"
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     permissions:
       contents: read
-      actions:  read
 
     env:
       IMAGE_TAG: "wiz-container-scanning:${{ github.sha }}"
-      COLUMNS:   "250"
-      TERM:      "xterm-256color"
 
     steps:
+      - uses: actions/checkout@v4
 
-      # ── SETUP ───────────────────────────────────────────────────────────────
+      - name: Build Docker image
+        run: docker build -t "$IMAGE_TAG" .
 
-      - name: "[Setup] Checkout"
-        uses: actions/checkout@v4
-
-      # ── BUILD (shared image for both scanners) ─────────────────────────────
-
-      - name: "[Build] Docker image"
-        timeout-minutes: 10
-        run: |
-          docker build --tag "$IMAGE_TAG" .
-          echo "::notice title=Docker Build::Built $IMAGE_TAG"
-
-      # ══════════════════════════════════════════════════════════════════════════
-      # PRISMA CLOUD SCAN
-      # ══════════════════════════════════════════════════════════════════════════
-
-      - name: "[Prisma] Download twistcli"
-        timeout-minutes: 3
-        env:
-          PCC_USER: ${{ secrets.PCC_USER }}
-          PCC_PASS: ${{ secrets.PCC_PASS }}
-        run: |
-          PCC_CONSOLE="https://asia-south1.cloud.twistlock.com/india-1131963775"
-          curl -fsSL \
-            -u "$PCC_USER:$PCC_PASS" \
-            -o /tmp/twistcli \
-            "${PCC_CONSOLE}/api/v1/util/twistcli"
-          chmod +x /tmp/twistcli
-          sudo mv /tmp/twistcli /usr/local/bin/twistcli
-          twistcli --version || echo "twistcli installed"
-
-      - name: "[Prisma] Scan Container Image"
-        id:   prisma_scan
+      # ── PRISMA SCAN ────────────────────────────────────────────────────────
+      - name: Prisma — Scan
         continue-on-error: true
-        timeout-minutes: 15
         env:
           PCC_USER: ${{ secrets.PCC_USER }}
           PCC_PASS: ${{ secrets.PCC_PASS }}
         run: |
-          PCC_CONSOLE="https://asia-south1.cloud.twistlock.com/india-1131963775"
-          PRISMA_EXIT=0
-          twistcli images scan \
-            --address "$PCC_CONSOLE" \
-            --user "$PCC_USER" \
-            --password "$PCC_PASS" \
-            --output-file prisma_results.json \
-            --details \
-            "$IMAGE_TAG" || PRISMA_EXIT=$?
+          PCC="https://asia-south1.cloud.twistlock.com/india-1131963775"
+          curl -fsSL -u "$PCC_USER:$PCC_PASS" -o /tmp/twistcli "$PCC/api/v1/util/twistcli"
+          chmod +x /tmp/twistcli
 
-          echo "prisma_exit=$PRISMA_EXIT" >> "$GITHUB_OUTPUT"
+          /tmp/twistcli images scan \
+            --address "$PCC" --user "$PCC_USER" --password "$PCC_PASS" \
+            --output-file prisma_results.json --details \
+            "$IMAGE_TAG" || true
 
-          echo "::group::Prisma Cloud scan output (first 100 lines)"
-          cat prisma_results.json 2>/dev/null | python3 -m json.tool 2>/dev/null | head -100 || echo "(no JSON output)"
-          echo "::endgroup::"
-
-          # Count Prisma findings from JSON
-          if [ -f prisma_results.json ]; then
-            PRISMA_COUNT=$(python3 -c "
+          python3 << 'PY' | tee /tmp/prisma_stats.txt
           import json
-          d=json.load(open('prisma_results.json'))
-          vulns=d.get('results',[{}])[0].get('vulnerabilities',[]) if d.get('results') else d.get('vulnerabilities',[])
-          print(len(vulns))
-          " 2>/dev/null || echo "?")
-            echo "::notice title=Prisma Scan::$PRISMA_COUNT findings (exit $PRISMA_EXIT)"
-          else
-            echo "::warning title=Prisma Scan::No output file generated (exit $PRISMA_EXIT)"
-          fi
+          d = json.load(open('prisma_results.json'))
+          vulns = d.get('results',[{}])[0].get('vulnerabilities',[])
+          sevs = {}
+          for v in vulns:
+              s = v.get('severity','unknown').lower()
+              sevs[s] = sevs.get(s, 0) + 1
+          print(f"TOTAL={len(vulns)}")
+          for s in ['critical','high','medium','low']:
+              print(f"{s.upper()}={sevs.get(s,0)}")
+          PY
 
-      # ══════════════════════════════════════════════════════════════════════════
-      # WIZ SCAN
-      # ══════════════════════════════════════════════════════════════════════════
-
-      - name: "[Wiz] Install CLI v1"
-        timeout-minutes: 3
+      # ── WIZ SCAN ──────────────────────────────────────────────────────────
+      - name: Wiz — Scan
+        continue-on-error: true
+        env:
+          WIZ_CLIENT_ID:     ${{ secrets.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
           curl -fsSL -o /tmp/wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64
           chmod +x /tmp/wizcli
-          sudo mv /tmp/wizcli /usr/local/bin/wizcli
-          wizcli version
+          sudo /tmp/wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
 
-      - name: "[Wiz] Authenticate"
-        timeout-minutes: 2
-        env:
-          WIZ_CLIENT_ID:     ${{ secrets.WIZ_CLIENT_ID }}
-          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
-        run: |
-          wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
-
-      - name: "[Wiz] Scan Container Image"
-        id:   wiz_scan
-        continue-on-error: true
-        timeout-minutes: 20
-        env:
-          WIZ_CLIENT_ID:     ${{ secrets.WIZ_CLIENT_ID }}
-          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
-        run: |
-          sudo -E $(which wizcli) auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
-
-          WIZ_EXIT=0
-          sudo -E $(which wizcli) docker scan \
-            --image  "$IMAGE_TAG" \
+          sudo -E /tmp/wizcli docker scan \
+            --image "$IMAGE_TAG" \
             --policies "Zee-Container-Security" \
-            --output wiz_image.sarif,sarif,vulnerabilities \
-            --output wiz_image.json,json,vulnerabilities \
-            --output wiz_image.txt,human,vulnerabilities || WIZ_EXIT=$?
+            --policy-hits-only \
+            --output wiz_results.json,json,vulnerabilities || true
 
-          sudo chown runner:runner wiz_image.sarif wiz_image.json wiz_image.txt 2>/dev/null || true
+          sudo chown runner:runner wiz_results.json 2>/dev/null || true
 
-          echo "wiz_exit=$WIZ_EXIT" >> "$GITHUB_OUTPUT"
-
-          echo "::group::Wiz scan output"
-          cat wiz_image.txt 2>/dev/null || echo "(no text output)"
-          echo "::endgroup::"
-
-          # Count ALL findings + filtered (Critical/High with fix only — matching Prisma)
-          if [ -f wiz_image.sarif ]; then
-            RESULTS=$(python3 -c "import json; d=json.load(open('wiz_image.sarif')); print(sum(len(r.get('results',[])) for r in d.get('runs',[])))" 2>/dev/null || echo "?")
-            echo "::notice title=Wiz Scan (all)::$RESULTS total findings in SARIF (exit $WIZ_EXIT)"
-          fi
-
-          # Filter Wiz JSON to match Prisma behavior: only Critical+High with a fix
-          if [ -f wiz_image.json ]; then
-            python3 << 'PYEOF' > /tmp/wiz_filtered.txt 2>/dev/null || true
+          python3 << 'PY' | tee /tmp/wiz_stats.txt
           import json
-          d=json.load(open('wiz_image.json'))
-          vulns=d.get('result',{}).get('vulnerabilities',[])
-          if not vulns:
-            for k in d:
-              if isinstance(d[k], dict):
-                vulns=d[k].get('vulnerabilities',[])
-                if vulns: break
-              elif isinstance(d[k], list):
-                vulns=d[k]
-                break
-          filtered=[v for v in vulns if v.get('severity','').upper() in ('CRITICAL','HIGH') and v.get('fixedVersion','') not in ('',None,'N/A')]
-          by_sev={}
-          for v in filtered:
-            s=v.get('severity','').upper()
-            by_sev[s]=by_sev.get(s,0)+1
-          print(f'FILTERED_TOTAL={len(filtered)}')
-          print(f'FILTERED_CRITICAL={by_sev.get("CRITICAL",0)}')
-          print(f'FILTERED_HIGH={by_sev.get("HIGH",0)}')
-          print(f'ALL_TOTAL={len(vulns)}')
-          PYEOF
+          d = json.load(open('wiz_results.json'))
+          result = d.get('result', {})
+          vulns = []
+          for pkg_type in ['osPackages','libraries','applications','cpes','endOfLifeTechnologies']:
+              for pkg in (result.get(pkg_type, []) or []):
+                  for v in (pkg.get('vulnerabilities', []) or []):
+                      vulns.append(v)
+          sevs = {}
+          for v in vulns:
+              s = v.get('severity','UNKNOWN').upper()
+              sevs[s] = sevs.get(s, 0) + 1
+          print(f"TOTAL={len(vulns)}")
+          for s in ['CRITICAL','HIGH','MEDIUM','LOW']:
+              print(f"{s}={sevs.get(s,0)}")
+          PY
 
-            while IFS='=' read -r key val; do
-              export "WIZ_$key=$val"
-            done < /tmp/wiz_filtered.txt 2>/dev/null || true
-            echo "::notice title=Wiz Scan (filtered)::${WIZ_FILTERED_TOTAL:-?} fixable Critical+High out of ${WIZ_ALL_TOTAL:-?} total"
-          fi
-
-      # ══════════════════════════════════════════════════════════════════════════
-      # COMPARISON REPORT
-      # ══════════════════════════════════════════════════════════════════════════
-
-      - name: "[Compare] Generate Comparison Summary"
+      # ── COMPARISON ────────────────────────────────────────────────────────
+      - name: Comparison Summary
         if: always()
         run: |
-          echo "# Prisma vs Wiz — Container Scan Comparison" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Image:** \`$IMAGE_TAG\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-
-          # ── Wiz stats (from SARIF) ──
-          WIZ_TOTAL="N/A"; WIZ_CRIT="0"; WIZ_HIGH="0"; WIZ_MED="0"; WIZ_LOW="0"
-          if [ -f wiz_image.sarif ]; then
-            python3 << 'PYEOF' > /tmp/wiz_sevs.txt 2>/dev/null || true
-          import json
-          d=json.load(open('wiz_image.sarif'))
-          results=[r for run in d.get('runs',[]) for r in run.get('results',[])]
-          sevs={}
-          for r in results:
-              msg=r.get('message',{}).get('text','')
-              sev='UNKNOWN'
-              for line in msg.split('\n'):
-                  if line.strip().lower().startswith('severity:'):
-                      sev=line.split(':',1)[1].strip().upper()
-                      break
-              if sev not in sevs: sevs[sev]=0
-              sevs[sev]+=1
-          print(f'TOTAL={len(results)}')
-          for s in ['CRITICAL','HIGH','MEDIUM','LOW','INFORMATIONAL','UNKNOWN']:
-              print(f'{s}={sevs.get(s,0)}')
-          PYEOF
-
-            while IFS='=' read -r key val; do
-              case "$key" in
-                TOTAL)    WIZ_TOTAL="$val" ;;
-                CRITICAL) WIZ_CRIT="$val" ;;
-                HIGH)     WIZ_HIGH="$val" ;;
-                MEDIUM)   WIZ_MED="$val" ;;
-                LOW)      WIZ_LOW="$val" ;;
-              esac
-            done < /tmp/wiz_sevs.txt 2>/dev/null || true
+          P_TOTAL="N/A"; P_CRIT=0; P_HIGH=0; P_MED=0; P_LOW=0
+          if [ -f /tmp/prisma_stats.txt ]; then
+            while IFS='=' read -r k v; do
+              case "$k" in TOTAL) P_TOTAL=$v;; CRITICAL) P_CRIT=$v;; HIGH) P_HIGH=$v;; MEDIUM) P_MED=$v;; LOW) P_LOW=$v;; esac
+            done < /tmp/prisma_stats.txt
           fi
 
-          # ── Prisma stats (from twistcli JSON) ──
-          PRISMA_TOTAL="N/A"; PRISMA_CRIT="0"; PRISMA_HIGH="0"; PRISMA_MED="0"; PRISMA_LOW="0"
-          if [ -f prisma_results.json ]; then
-            python3 << 'PYEOF' > /tmp/prisma_sevs.txt 2>/dev/null || true
-          import json
-          d=json.load(open('prisma_results.json'))
-          # twistcli JSON: {"results":[{"vulnerabilities":[...]}]}
-          vulns=[]
-          if isinstance(d, dict):
-              for r in d.get('results',[]):
-                  vulns.extend(r.get('vulnerabilities',[]))
-              if not vulns:
-                  vulns=d.get('vulnerabilities',[])
-          elif isinstance(d, list):
-              for item in d:
-                  if isinstance(item, dict):
-                      vulns.extend(item.get('vulnerabilities',[]))
-          sevs={}
-          for v in vulns:
-              s=v.get('severity','unknown').lower()
-              if s not in sevs: sevs[s]=0
-              sevs[s]+=1
-          print(f'TOTAL={len(vulns)}')
-          for s in ['critical','high','medium','low']:
-              print(f'{s.upper()}={sevs.get(s,0)}')
-          PYEOF
-
-            while IFS='=' read -r key val; do
-              case "$key" in
-                TOTAL)    PRISMA_TOTAL="$val" ;;
-                CRITICAL) PRISMA_CRIT="$val" ;;
-                HIGH)     PRISMA_HIGH="$val" ;;
-                MEDIUM)   PRISMA_MED="$val" ;;
-                LOW)      PRISMA_LOW="$val" ;;
-              esac
-            done < /tmp/prisma_sevs.txt 2>/dev/null || true
+          W_TOTAL="N/A"; W_CRIT=0; W_HIGH=0; W_MED=0; W_LOW=0
+          if [ -f /tmp/wiz_stats.txt ]; then
+            while IFS='=' read -r k v; do
+              case "$k" in TOTAL) W_TOTAL=$v;; CRITICAL) W_CRIT=$v;; HIGH) W_HIGH=$v;; MEDIUM) W_MED=$v;; LOW) W_LOW=$v;; esac
+            done < /tmp/wiz_stats.txt
           fi
 
-          # ── Wiz filtered stats (Critical+High with fix — Prisma-comparable) ──
-          WIZ_FILT_TOTAL="N/A"; WIZ_FILT_CRIT="0"; WIZ_FILT_HIGH="0"
-          if [ -f wiz_image.json ]; then
-            python3 << 'PYEOF' > /tmp/wiz_filt.txt 2>/dev/null || true
-          import json
-          d=json.load(open('wiz_image.json'))
-          vulns=d.get('result',{}).get('vulnerabilities',[])
-          if not vulns:
-            for k in d:
-              if isinstance(d[k], dict):
-                vulns=d[k].get('vulnerabilities',[])
-                if vulns: break
-              elif isinstance(d[k], list):
-                vulns=d[k]
-                break
-          filtered=[v for v in vulns if v.get('severity','').upper() in ('CRITICAL','HIGH') and v.get('fixedVersion','') not in ('',None,'N/A')]
-          by_sev={}
-          for v in filtered:
-            s=v.get('severity','').upper()
-            by_sev[s]=by_sev.get(s,0)+1
-          print(f'TOTAL={len(filtered)}')
-          print(f'CRITICAL={by_sev.get("CRITICAL",0)}')
-          print(f'HIGH={by_sev.get("HIGH",0)}')
-          PYEOF
+          {
+            echo "# Prisma vs Wiz — Container Scan Comparison"
+            echo ""
+            echo "**Image:** \`$IMAGE_TAG\`"
+            echo "**Wiz Policy:** \`Zee-Container-Security\` (ignore unfixed CVEs)"
+            echo ""
+            echo "## Vulnerability Counts"
+            echo ""
+            echo "| Severity | Prisma Cloud | Wiz |"
+            echo "|---|---:|---:|"
+            echo "| 🔴 Critical | $P_CRIT | $W_CRIT |"
+            echo "| 🟠 High | $P_HIGH | $W_HIGH |"
+            echo "| 🟡 Medium | $P_MED | $W_MED |"
+            echo "| 🟢 Low | $P_LOW | $W_LOW |"
+            echo "| **Total** | **$P_TOTAL** | **$W_TOTAL** |"
+            echo ""
+            echo "---"
+            echo "_Run: $(date -u '+%Y-%m-%d %H:%M UTC')_"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-            while IFS='=' read -r key val; do
-              case "$key" in
-                TOTAL)    WIZ_FILT_TOTAL="$val" ;;
-                CRITICAL) WIZ_FILT_CRIT="$val" ;;
-                HIGH)     WIZ_FILT_HIGH="$val" ;;
-              esac
-            done < /tmp/wiz_filt.txt 2>/dev/null || true
-          fi
-
-          # ── Write comparison table ──
-          echo "## Scan Results — All Findings" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Metric | Prisma Cloud | Wiz |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---:|---:|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Total Findings | $PRISMA_TOTAL | $WIZ_TOTAL |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| 🔴 Critical | $PRISMA_CRIT | $WIZ_CRIT |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| 🟠 High | $PRISMA_HIGH | $WIZ_HIGH |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| 🟡 Medium | $PRISMA_MED | $WIZ_MED |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| 🟢 Low | $PRISMA_LOW | $WIZ_LOW |" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-
-          echo "## Apples-to-Apples — Critical+High with Fix Available" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "> Prisma only reports fixable CVEs by default. This table filters Wiz to match." >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Metric | Prisma Cloud | Wiz (filtered) |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---:|---:|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| 🔴 Critical (fixable) | $PRISMA_CRIT | $WIZ_FILT_CRIT |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| 🟠 High (fixable) | $PRISMA_HIGH | $WIZ_FILT_HIGH |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Total (fixable Crit+High)** | **$(( ${PRISMA_CRIT:-0} + ${PRISMA_HIGH:-0} ))** | **$WIZ_FILT_TOTAL** |" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-
-          echo "## Scanner Details" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Feature | Prisma Cloud (twistcli) | Wiz CLI v1 |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Scan Method | \`twistcli images scan\` | \`wizcli docker scan\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| SCA (Source Deps) | Via separate scan | \`wizcli dir scan\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| IaC (Dockerfile) | ❌ | \`wizcli iac scan\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| SARIF Output | ✅ (\`--sarif\`) | ✅ (\`--output sarif\`) |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| GitHub Security Upload | ✅ (\`upload-sarif\`) | ✅ (\`upload-sarif\`) |" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "---" >> "$GITHUB_STEP_SUMMARY"
-          echo "_Comparison run: $(date -u '+%Y-%m-%d %H:%M UTC')_" >> "$GITHUB_STEP_SUMMARY"
-
-      # ── ARTIFACTS ───────────────────────────────────────────────────────────
-
-      - name: "[Artifacts] Archive All Scan Outputs"
+      - name: Upload Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: "scan-comparison-${{ github.run_id }}"
+          name: scan-comparison-${{ github.run_id }}
           retention-days: 30
           if-no-files-found: warn
           path: |
             prisma_results.json
-            wiz_image.sarif
-            wiz_image.json
-            wiz_image.txt
+            wiz_results.json
