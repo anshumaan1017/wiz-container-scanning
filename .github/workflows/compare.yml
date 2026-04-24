@@ -83,12 +83,24 @@ jobs:
 
           echo "prisma_exit=$PRISMA_EXIT" >> "$GITHUB_OUTPUT"
 
-          echo "::group::Prisma Cloud scan output"
-          cat prisma_results.json 2>/dev/null | python3 -m json.tool 2>/dev/null | head -200 || echo "(no JSON output)"
+          echo "::group::Prisma Cloud scan output (first 100 lines)"
+          cat prisma_results.json 2>/dev/null | python3 -m json.tool 2>/dev/null | head -100 || echo "(no JSON output)"
           echo "::endgroup::"
 
-          if [ -f prisma_results.json ]; then
-            echo "::notice title=Prisma Scan::Scan complete (exit $PRISMA_EXIT), results saved"
+          # Also generate SARIF for apples-to-apples comparison
+          twistcli images scan \
+            --address "$PCC_CONSOLE" \
+            --user "$PCC_USER" \
+            --password "$PCC_PASS" \
+            --output-file prisma_results.sarif \
+            --sarif \
+            "$IMAGE_TAG" || true
+
+          if [ -f prisma_results.sarif ]; then
+            PRISMA_SARIF_COUNT=$(python3 -c "import json; d=json.load(open('prisma_results.sarif')); print(sum(len(r.get('results',[])) for r in d.get('runs',[])))" 2>/dev/null || echo "?")
+            echo "::notice title=Prisma Scan::$PRISMA_SARIF_COUNT findings in SARIF (exit $PRISMA_EXIT)"
+          elif [ -f prisma_results.json ]; then
+            echo "::notice title=Prisma Scan::Scan complete (exit $PRISMA_EXIT), JSON results saved"
           else
             echo "::warning title=Prisma Scan::No output file generated (exit $PRISMA_EXIT)"
           fi
@@ -126,7 +138,6 @@ jobs:
           WIZ_EXIT=0
           sudo -E $(which wizcli) docker scan \
             --image  "$IMAGE_TAG" \
-            --driver mountWithLayers \
             --output wiz_image.sarif,sarif,vulnerabilities \
             --output wiz_image.txt,human,vulnerabilities || WIZ_EXIT=$?
 
@@ -155,17 +166,10 @@ jobs:
           echo "**Image:** \`$IMAGE_TAG\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
-          # ── Wiz stats ──
+          # ── Wiz stats (from SARIF) ──
           WIZ_TOTAL="N/A"; WIZ_CRIT="0"; WIZ_HIGH="0"; WIZ_MED="0"; WIZ_LOW="0"
           if [ -f wiz_image.sarif ]; then
-            WIZ_TOTAL=$(python3 -c "
-          import json
-          d=json.load(open('wiz_image.sarif'))
-          results=[r for run in d.get('runs',[]) for r in run.get('results',[])]
-          print(len(results))
-          " 2>/dev/null || echo "?")
-
-            python3 -c "
+            python3 << 'PYEOF' > /tmp/wiz_sevs.txt 2>/dev/null || true
           import json
           d=json.load(open('wiz_image.sarif'))
           results=[r for run in d.get('runs',[]) for r in run.get('results',[])]
@@ -179,12 +183,14 @@ jobs:
                       break
               if sev not in sevs: sevs[sev]=0
               sevs[sev]+=1
+          print(f'TOTAL={len(results)}')
           for s in ['CRITICAL','HIGH','MEDIUM','LOW','INFORMATIONAL','UNKNOWN']:
               print(f'{s}={sevs.get(s,0)}')
-          " 2>/dev/null > /tmp/wiz_sevs.txt || true
+          PYEOF
 
             while IFS='=' read -r key val; do
               case "$key" in
+                TOTAL)    WIZ_TOTAL="$val" ;;
                 CRITICAL) WIZ_CRIT="$val" ;;
                 HIGH)     WIZ_HIGH="$val" ;;
                 MEDIUM)   WIZ_MED="$val" ;;
@@ -193,13 +199,47 @@ jobs:
             done < /tmp/wiz_sevs.txt 2>/dev/null || true
           fi
 
-          # ── Prisma stats (best-effort from JSON) ──
+          # ── Prisma stats (from SARIF if available, else JSON) ──
           PRISMA_TOTAL="N/A"; PRISMA_CRIT="0"; PRISMA_HIGH="0"; PRISMA_MED="0"; PRISMA_LOW="0"
-          if [ -f prisma_results.json ]; then
-            python3 -c "
+          if [ -f prisma_results.sarif ]; then
+            python3 << 'PYEOF' > /tmp/prisma_sevs.txt 2>/dev/null || true
+          import json
+          d=json.load(open('prisma_results.sarif'))
+          results=[r for run in d.get('runs',[]) for r in run.get('results',[])]
+          # Prisma SARIF: severity from rule shortDescription "CVE-xxxx (severity)"
+          rule_map={}
+          for run in d.get('runs',[]):
+              for rule in run.get('tool',{}).get('driver',{}).get('rules',[]):
+                  rid=rule.get('id','')
+                  desc=rule.get('shortDescription',{}).get('text','')
+                  sev='UNKNOWN'
+                  if '(' in desc and ')' in desc:
+                      sev=desc.split('(')[-1].replace(')','').strip().upper()
+                  rule_map[rid]=sev
+          sevs={}
+          for r in results:
+              rid=r.get('ruleId','')
+              sev=rule_map.get(rid,'UNKNOWN')
+              if sev not in sevs: sevs[sev]=0
+              sevs[sev]+=1
+          print(f'TOTAL={len(results)}')
+          for s in ['CRITICAL','HIGH','MEDIUM','LOW']:
+              print(f'{s}={sevs.get(s,0)}')
+          PYEOF
+
+            while IFS='=' read -r key val; do
+              case "$key" in
+                TOTAL)    PRISMA_TOTAL="$val" ;;
+                CRITICAL) PRISMA_CRIT="$val" ;;
+                HIGH)     PRISMA_HIGH="$val" ;;
+                MEDIUM)   PRISMA_MED="$val" ;;
+                LOW)      PRISMA_LOW="$val" ;;
+              esac
+            done < /tmp/prisma_sevs.txt 2>/dev/null || true
+          elif [ -f prisma_results.json ]; then
+            python3 << 'PYEOF' > /tmp/prisma_sevs.txt 2>/dev/null || true
           import json
           d=json.load(open('prisma_results.json'))
-          # Prisma twistcli JSON varies — try common structures
           vulns=[]
           if isinstance(d, list):
               for item in d:
@@ -217,7 +257,7 @@ jobs:
           print(f'TOTAL={len(vulns)}')
           for s in ['CRITICAL','HIGH','MEDIUM','LOW']:
               print(f'{s}={sevs.get(s,0)}')
-          " 2>/dev/null > /tmp/prisma_sevs.txt || true
+          PYEOF
 
             while IFS='=' read -r key val; do
               case "$key" in
@@ -246,11 +286,10 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Feature | Prisma Cloud (twistcli) | Wiz CLI v1 |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Scan Method | \`twistcli images scan\` | \`wizcli docker scan --driver mountWithLayers\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Per-Layer Breakdown | ❌ | ✅ |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Scan Method | \`twistcli images scan\` | \`wizcli docker scan\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| SCA (Source Deps) | Via separate scan | \`wizcli dir scan\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| IaC (Dockerfile) | ❌ | \`wizcli iac scan\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| SARIF Output | ✅ | ✅ |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| SARIF Output | ✅ (\`--sarif\`) | ✅ (\`--output sarif\`) |" >> "$GITHUB_STEP_SUMMARY"
           echo "| GitHub Security Upload | ✅ (\`upload-sarif\`) | ✅ (\`upload-sarif\`) |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "---" >> "$GITHUB_STEP_SUMMARY"
@@ -267,5 +306,6 @@ jobs:
           if-no-files-found: warn
           path: |
             prisma_results.json
+            prisma_results.sarif
             wiz_image.sarif
             wiz_image.txt

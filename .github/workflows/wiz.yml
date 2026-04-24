@@ -72,8 +72,10 @@ jobs:
           echo "::notice title=Docker Build::Built $IMAGE_TAG successfully"
 
       # ── CONTAINER IMAGE SCAN (→ SARIF upload) ──────────────────────────────
+      # NOTE: No --driver mountWithLayers — it duplicates CVEs across every layer
+      #       causing 2000+ noisy findings. Simple docker scan deduplicates.
 
-      - name: "[Scan] Container Image — Per-Layer Vulnerability Scan"
+      - name: "[Scan] Container Image Vulnerabilities"
         id:   container_scan
         continue-on-error: true
         timeout-minutes: 20
@@ -87,18 +89,16 @@ jobs:
           sudo -E $(which wizcli) docker scan \
             --image    "$IMAGE_TAG" \
             --policies "$POLICY" \
-            --driver   mountWithLayers \
             --output   image.sarif,sarif,vulnerabilities \
-            --output   image.txt,human,vulnerabilities \
-            --output   image-layers.json,json,vulnerabilities || CONTAINER_EXIT=$?
+            --output   image.txt,human,vulnerabilities || CONTAINER_EXIT=$?
 
-          sudo chown runner:runner image.sarif image.txt image-layers.json 2>/dev/null || true
+          sudo chown runner:runner image.sarif image.txt 2>/dev/null || true
 
           echo "::group::Container scan output"
           cat image.txt 2>/dev/null || echo "(no text output)"
           echo "::endgroup::"
 
-          ls -lh image.sarif image-layers.json 2>/dev/null || true
+          ls -lh image.sarif 2>/dev/null || true
 
           if [ -f image.sarif ]; then
             RESULTS=$(python3 -c "import json; d=json.load(open('image.sarif')); print(sum(len(r.get('results',[])) for r in d.get('runs',[])))" 2>/dev/null || echo "?")
@@ -160,7 +160,7 @@ jobs:
         timeout-minutes: 5
         run: |
           Write-Host "::group::Input file inventory"
-          @("image.sarif","image-layers.json","dir.sarif","dockerfile.sarif") | ForEach-Object {
+          @("image.sarif","dir.sarif","dockerfile.sarif") | ForEach-Object {
             $exists = Test-Path -LiteralPath $_
             $status = $exists ? "FOUND" : "NOT FOUND — skipping"
             Write-Host ("  {0,-30} {1}" -f $_, $status)
@@ -169,7 +169,6 @@ jobs:
 
           ./scripts/parse_wiz_image_scan.ps1 `
             -ImageSarifPath      image.sarif `
-            -ImageLayersPath     image-layers.json `
             -DirSarifPath        dir.sarif `
             -DockerfileSarifPath dockerfile.sarif `
             -SummaryMarkdownPath wiz-summary.md `
@@ -198,7 +197,6 @@ jobs:
             wiz-summary.md
             image.sarif
             image.txt
-            image-layers.json
             dir.sarif
             dir.txt
             dockerfile.sarif
