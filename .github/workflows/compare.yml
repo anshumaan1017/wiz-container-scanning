@@ -87,20 +87,15 @@ jobs:
           cat prisma_results.json 2>/dev/null | python3 -m json.tool 2>/dev/null | head -100 || echo "(no JSON output)"
           echo "::endgroup::"
 
-          # Also generate SARIF for apples-to-apples comparison
-          twistcli images scan \
-            --address "$PCC_CONSOLE" \
-            --user "$PCC_USER" \
-            --password "$PCC_PASS" \
-            --output-file prisma_results.sarif \
-            --sarif \
-            "$IMAGE_TAG" || true
-
-          if [ -f prisma_results.sarif ]; then
-            PRISMA_SARIF_COUNT=$(python3 -c "import json; d=json.load(open('prisma_results.sarif')); print(sum(len(r.get('results',[])) for r in d.get('runs',[])))" 2>/dev/null || echo "?")
-            echo "::notice title=Prisma Scan::$PRISMA_SARIF_COUNT findings in SARIF (exit $PRISMA_EXIT)"
-          elif [ -f prisma_results.json ]; then
-            echo "::notice title=Prisma Scan::Scan complete (exit $PRISMA_EXIT), JSON results saved"
+          # Count Prisma findings from JSON
+          if [ -f prisma_results.json ]; then
+            PRISMA_COUNT=$(python3 -c "
+          import json
+          d=json.load(open('prisma_results.json'))
+          vulns=d.get('results',[{}])[0].get('vulnerabilities',[]) if d.get('results') else d.get('vulnerabilities',[])
+          print(len(vulns))
+          " 2>/dev/null || echo "?")
+            echo "::notice title=Prisma Scan::$PRISMA_COUNT findings (exit $PRISMA_EXIT)"
           else
             echo "::warning title=Prisma Scan::No output file generated (exit $PRISMA_EXIT)"
           fi
@@ -199,64 +194,31 @@ jobs:
             done < /tmp/wiz_sevs.txt 2>/dev/null || true
           fi
 
-          # ── Prisma stats (from SARIF if available, else JSON) ──
+          # ── Prisma stats (from twistcli JSON) ──
           PRISMA_TOTAL="N/A"; PRISMA_CRIT="0"; PRISMA_HIGH="0"; PRISMA_MED="0"; PRISMA_LOW="0"
-          if [ -f prisma_results.sarif ]; then
-            python3 << 'PYEOF' > /tmp/prisma_sevs.txt 2>/dev/null || true
-          import json
-          d=json.load(open('prisma_results.sarif'))
-          results=[r for run in d.get('runs',[]) for r in run.get('results',[])]
-          # Prisma SARIF: severity from rule shortDescription "CVE-xxxx (severity)"
-          rule_map={}
-          for run in d.get('runs',[]):
-              for rule in run.get('tool',{}).get('driver',{}).get('rules',[]):
-                  rid=rule.get('id','')
-                  desc=rule.get('shortDescription',{}).get('text','')
-                  sev='UNKNOWN'
-                  if '(' in desc and ')' in desc:
-                      sev=desc.split('(')[-1].replace(')','').strip().upper()
-                  rule_map[rid]=sev
-          sevs={}
-          for r in results:
-              rid=r.get('ruleId','')
-              sev=rule_map.get(rid,'UNKNOWN')
-              if sev not in sevs: sevs[sev]=0
-              sevs[sev]+=1
-          print(f'TOTAL={len(results)}')
-          for s in ['CRITICAL','HIGH','MEDIUM','LOW']:
-              print(f'{s}={sevs.get(s,0)}')
-          PYEOF
-
-            while IFS='=' read -r key val; do
-              case "$key" in
-                TOTAL)    PRISMA_TOTAL="$val" ;;
-                CRITICAL) PRISMA_CRIT="$val" ;;
-                HIGH)     PRISMA_HIGH="$val" ;;
-                MEDIUM)   PRISMA_MED="$val" ;;
-                LOW)      PRISMA_LOW="$val" ;;
-              esac
-            done < /tmp/prisma_sevs.txt 2>/dev/null || true
-          elif [ -f prisma_results.json ]; then
+          if [ -f prisma_results.json ]; then
             python3 << 'PYEOF' > /tmp/prisma_sevs.txt 2>/dev/null || true
           import json
           d=json.load(open('prisma_results.json'))
+          # twistcli JSON: {"results":[{"vulnerabilities":[...]}]}
           vulns=[]
-          if isinstance(d, list):
-              for item in d:
-                  vulns.extend(item.get('vulnerabilities',[]))
-          elif isinstance(d, dict):
+          if isinstance(d, dict):
               for r in d.get('results',[]):
                   vulns.extend(r.get('vulnerabilities',[]))
               if not vulns:
                   vulns=d.get('vulnerabilities',[])
+          elif isinstance(d, list):
+              for item in d:
+                  if isinstance(item, dict):
+                      vulns.extend(item.get('vulnerabilities',[]))
           sevs={}
           for v in vulns:
-              s=v.get('severity','unknown').upper()
+              s=v.get('severity','unknown').lower()
               if s not in sevs: sevs[s]=0
               sevs[s]+=1
           print(f'TOTAL={len(vulns)}')
-          for s in ['CRITICAL','HIGH','MEDIUM','LOW']:
-              print(f'{s}={sevs.get(s,0)}')
+          for s in ['critical','high','medium','low']:
+              print(f'{s.upper()}={sevs.get(s,0)}')
           PYEOF
 
             while IFS='=' read -r key val; do
@@ -306,6 +268,5 @@ jobs:
           if-no-files-found: warn
           path: |
             prisma_results.json
-            prisma_results.sarif
             wiz_image.sarif
             wiz_image.txt
