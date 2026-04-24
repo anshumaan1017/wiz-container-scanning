@@ -40,20 +40,12 @@ jobs:
           d = json.load(open('prisma_results.json'))
           vulns = d.get('results',[{}])[0].get('vulnerabilities',[])
           sevs = {}
-          exploit_sevs = {}
           for v in vulns:
               s = v.get('severity','unknown').lower()
               sevs[s] = sevs.get(s, 0) + 1
-              rf = ' '.join(v.get('riskFactors', []))
-              if 'exploit' in rf.lower():
-                  exploit_sevs[s] = exploit_sevs.get(s, 0) + 1
           print(f"TOTAL={len(vulns)}")
           for s in ['critical','high','medium','low']:
               print(f"{s.upper()}={sevs.get(s,0)}")
-          exploit_total = sum(exploit_sevs.values())
-          print(f"EXPLOIT_TOTAL={exploit_total}")
-          for s in ['critical','high','medium','low']:
-              print(f"EXPLOIT_{s.upper()}={exploit_sevs.get(s,0)}")
           PY
 
       # ── WIZ SCAN ──────────────────────────────────────────────────────────
@@ -80,72 +72,42 @@ jobs:
           result = d.get('result', {})
 
           all_vulns = []
-          policy_failed = []
           exploitable = []
           for pkg_type in ['osPackages','libraries','applications','cpes','endOfLifeTechnologies']:
               for pkg in (result.get(pkg_type, []) or []):
                   for v in (pkg.get('vulnerabilities', []) or []):
                       all_vulns.append(v)
-                      if v.get('failedPolicyMatches'):
-                          policy_failed.append(v)
                       if v.get('hasExploit'):
                           exploitable.append(v)
 
-          # All vulns by severity
+          # Only count exploitable CVEs
           sevs = {}
-          for v in all_vulns:
-              s = v.get('severity','UNKNOWN').upper()
-              sevs[s] = sevs.get(s, 0) + 1
-          print(f"TOTAL={len(all_vulns)}")
-          for s in ['CRITICAL','HIGH','MEDIUM','LOW']:
-              print(f"{s}={sevs.get(s,0)}")
-
-          # Policy-failed
-          print(f"POLICY_TOTAL={len(policy_failed)}")
-          pf_sevs = {}
-          for v in policy_failed:
-              s = v.get('severity','UNKNOWN').upper()
-              pf_sevs[s] = pf_sevs.get(s, 0) + 1
-          for s in ['CRITICAL','HIGH','MEDIUM','LOW']:
-              print(f"POLICY_{s}={pf_sevs.get(s,0)}")
-
-          # Exploitable (hasExploit=true)
-          print(f"EXPLOIT_TOTAL={len(exploitable)}")
-          ex_sevs = {}
           for v in exploitable:
               s = v.get('severity','UNKNOWN').upper()
-              ex_sevs[s] = ex_sevs.get(s, 0) + 1
+              sevs[s] = sevs.get(s, 0) + 1
+          print(f"TOTAL={len(exploitable)}")
           for s in ['CRITICAL','HIGH','MEDIUM','LOW']:
-              print(f"EXPLOIT_{s}={ex_sevs.get(s,0)}")
+              print(f"{s}={sevs.get(s,0)}")
+          print(f"ALL_SCANNED={len(all_vulns)}")
           PY
 
       # ── COMPARISON ────────────────────────────────────────────────────────
       - name: Comparison Summary
         if: always()
         run: |
-          # Parse Prisma stats
+          # Parse Prisma stats (all vulns)
           P_TOTAL=0; P_CRIT=0; P_HIGH=0; P_MED=0; P_LOW=0
-          PE_TOTAL=0; PE_CRIT=0; PE_HIGH=0; PE_MED=0; PE_LOW=0
           if [ -f /tmp/prisma_stats.txt ]; then
             while IFS='=' read -r k v; do
-              case "$k" in
-                TOTAL) P_TOTAL=$v;; CRITICAL) P_CRIT=$v;; HIGH) P_HIGH=$v;; MEDIUM) P_MED=$v;; LOW) P_LOW=$v;;
-                EXPLOIT_TOTAL) PE_TOTAL=$v;; EXPLOIT_CRITICAL) PE_CRIT=$v;; EXPLOIT_HIGH) PE_HIGH=$v;; EXPLOIT_MEDIUM) PE_MED=$v;; EXPLOIT_LOW) PE_LOW=$v;;
-              esac
+              case "$k" in TOTAL) P_TOTAL=$v;; CRITICAL) P_CRIT=$v;; HIGH) P_HIGH=$v;; MEDIUM) P_MED=$v;; LOW) P_LOW=$v;; esac
             done < /tmp/prisma_stats.txt
           fi
 
-          # Parse Wiz stats
-          W_TOTAL=0; W_CRIT=0; W_HIGH=0; W_MED=0; W_LOW=0
-          WP_TOTAL=0; WP_CRIT=0; WP_HIGH=0; WP_MED=0; WP_LOW=0
-          WE_TOTAL=0; WE_CRIT=0; WE_HIGH=0; WE_MED=0; WE_LOW=0
+          # Parse Wiz stats (exploit-only)
+          W_TOTAL=0; W_CRIT=0; W_HIGH=0; W_MED=0; W_LOW=0; W_ALL=0
           if [ -f /tmp/wiz_stats.txt ]; then
             while IFS='=' read -r k v; do
-              case "$k" in
-                TOTAL) W_TOTAL=$v;; CRITICAL) W_CRIT=$v;; HIGH) W_HIGH=$v;; MEDIUM) W_MED=$v;; LOW) W_LOW=$v;;
-                POLICY_TOTAL) WP_TOTAL=$v;; POLICY_CRITICAL) WP_CRIT=$v;; POLICY_HIGH) WP_HIGH=$v;; POLICY_MEDIUM) WP_MED=$v;; POLICY_LOW) WP_LOW=$v;;
-                EXPLOIT_TOTAL) WE_TOTAL=$v;; EXPLOIT_CRITICAL) WE_CRIT=$v;; EXPLOIT_HIGH) WE_HIGH=$v;; EXPLOIT_MEDIUM) WE_MED=$v;; EXPLOIT_LOW) WE_LOW=$v;;
-              esac
+              case "$k" in TOTAL) W_TOTAL=$v;; CRITICAL) W_CRIT=$v;; HIGH) W_HIGH=$v;; MEDIUM) W_MED=$v;; LOW) W_LOW=$v;; ALL_SCANNED) W_ALL=$v;; esac
             done < /tmp/wiz_stats.txt
           fi
 
@@ -154,43 +116,18 @@ jobs:
             echo ""
             echo "**Image:** \`$IMAGE_TAG\`"
             echo "**Wiz Policy:** \`Zee-Container-Security\`"
+            echo "**Wiz Filter:** 💥 Public Exploit only (\`hasExploit=true\`)"
             echo ""
-
-            echo "## 🔍 All Vulnerabilities"
+            echo "> Prisma shows all findings. Wiz shows only CVEs with a **known public exploit**."
+            echo "> Wiz scanned $W_ALL total CVEs; $W_TOTAL have a public exploit."
             echo ""
-            echo "| Severity | Prisma | Wiz |"
+            echo "| Severity | Prisma (all) | Wiz (💥 exploit only) |"
             echo "|---|---:|---:|"
             echo "| 🔴 Critical | $P_CRIT | $W_CRIT |"
             echo "| 🟠 High | $P_HIGH | $W_HIGH |"
             echo "| 🟡 Medium | $P_MED | $W_MED |"
             echo "| 🟢 Low | $P_LOW | $W_LOW |"
             echo "| **Total** | **$P_TOTAL** | **$W_TOTAL** |"
-            echo ""
-
-            echo "## 🛡️ Policy-Failed (Zee-Container-Security)"
-            echo ""
-            echo "> CVEs that violated the policy rules."
-            echo ""
-            echo "| Severity | Wiz (policy-failed) |"
-            echo "|---|---:|"
-            echo "| 🔴 Critical | $WP_CRIT |"
-            echo "| 🟠 High | $WP_HIGH |"
-            echo "| 🟡 Medium | $WP_MED |"
-            echo "| 🟢 Low | $WP_LOW |"
-            echo "| **Total** | **$WP_TOTAL** |"
-            echo ""
-
-            echo "## 💥 Public Exploit Available"
-            echo ""
-            echo "> CVEs with known public exploit — highest real-world risk."
-            echo ""
-            echo "| Severity | Prisma | Wiz |"
-            echo "|---|---:|---:|"
-            echo "| 🔴 Critical | $PE_CRIT | $WE_CRIT |"
-            echo "| 🟠 High | $PE_HIGH | $WE_HIGH |"
-            echo "| 🟡 Medium | $PE_MED | $WE_MED |"
-            echo "| 🟢 Low | $PE_LOW | $WE_LOW |"
-            echo "| **Total** | **$PE_TOTAL** | **$WE_TOTAL** |"
             echo ""
             echo "---"
             echo "_Run: $(date -u '+%Y-%m-%d %H:%M UTC')_"
