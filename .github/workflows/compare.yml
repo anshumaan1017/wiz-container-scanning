@@ -71,24 +71,43 @@ jobs:
           d = json.load(open('wiz_results.json'))
           result = d.get('result', {})
 
-          all_vulns = []
-          exploitable = []
+          # Collect vulns per category
+          cats = {}
           for pkg_type in ['osPackages','libraries','applications','cpes','endOfLifeTechnologies']:
+              cat_vulns = []
               for pkg in (result.get(pkg_type, []) or []):
                   for v in (pkg.get('vulnerabilities', []) or []):
-                      all_vulns.append(v)
-                      if v.get('hasExploit') and v.get('fixedVersion') not in (None, ''):
-                          exploitable.append(v)
+                      v['_src'] = pkg_type
+                      cat_vulns.append(v)
+              cats[pkg_type] = cat_vulns
 
-          # Only count exploitable + fixable CVEs
+          all_vulns = [v for vs in cats.values() for v in vs]
+
+          # Progressive filtering
+          cs_lib = [v for v in all_vulns if v['_src'] in ('osPackages','libraries')]
+          cs_lib_exploit = [v for v in cs_lib if v.get('hasExploit')]
+          cs_lib_exploit_fix = [v for v in cs_lib_exploit if v.get('fixedVersion') not in (None, '')]
+
+          # Print progressive counts for summary
+          print(f"RAW_ALL={len(all_vulns)}")
+          print(f"CS_LIB={len(cs_lib)}")
+          print(f"CS_LIB_EXPLOIT={len(cs_lib_exploit)}")
+          print(f"CS_LIB_EXPLOIT_FIX={len(cs_lib_exploit_fix)}")
+
+          # Final filtered set severity breakdown
           sevs = {}
-          for v in exploitable:
+          for v in cs_lib_exploit_fix:
               s = v.get('severity','UNKNOWN').upper()
               sevs[s] = sevs.get(s, 0) + 1
-          print(f"TOTAL={len(exploitable)}")
+          print(f"TOTAL={len(cs_lib_exploit_fix)}")
           for s in ['CRITICAL','HIGH','MEDIUM','LOW']:
               print(f"{s}={sevs.get(s,0)}")
-          print(f"ALL_SCANNED={len(all_vulns)}")
+
+          # OS vs Library split
+          os_count = len([v for v in cs_lib_exploit_fix if v['_src']=='osPackages'])
+          lib_count = len([v for v in cs_lib_exploit_fix if v['_src']=='libraries'])
+          print(f"OS_PKG={os_count}")
+          print(f"LIB_PKG={lib_count}")
           PY
 
       # ── COMPARISON ────────────────────────────────────────────────────────
@@ -103,12 +122,34 @@ jobs:
             done < /tmp/prisma_stats.txt
           fi
 
-          # Parse Wiz stats (exploit-only)
-          W_TOTAL=0; W_CRIT=0; W_HIGH=0; W_MED=0; W_LOW=0; W_ALL=0
+          # Parse Wiz stats
+          W_TOTAL=0; W_CRIT=0; W_HIGH=0; W_MED=0; W_LOW=0
+          W_RAW=0; W_CSLIB=0; W_CSLIB_EXP=0; W_CSLIB_EXP_FIX=0
+          W_OS=0; W_LIB=0
           if [ -f /tmp/wiz_stats.txt ]; then
             while IFS='=' read -r k v; do
-              case "$k" in TOTAL) W_TOTAL=$v;; CRITICAL) W_CRIT=$v;; HIGH) W_HIGH=$v;; MEDIUM) W_MED=$v;; LOW) W_LOW=$v;; ALL_SCANNED) W_ALL=$v;; esac
+              case "$k" in
+                TOTAL) W_TOTAL=$v;;
+                CRITICAL) W_CRIT=$v;;
+                HIGH) W_HIGH=$v;;
+                MEDIUM) W_MED=$v;;
+                LOW) W_LOW=$v;;
+                RAW_ALL) W_RAW=$v;;
+                CS_LIB) W_CSLIB=$v;;
+                CS_LIB_EXPLOIT) W_CSLIB_EXP=$v;;
+                CS_LIB_EXPLOIT_FIX) W_CSLIB_EXP_FIX=$v;;
+                OS_PKG) W_OS=$v;;
+                LIB_PKG) W_LIB=$v;;
+              esac
             done < /tmp/wiz_stats.txt
+          fi
+
+          # Compute noise reduction %
+          if [ "$W_RAW" -gt 0 ]; then
+            REMOVED=$((W_RAW - W_TOTAL))
+            PCT=$(python3 -c "print(f'{100*$REMOVED/$W_RAW:.1f}')")
+          else
+            REMOVED=0; PCT="0.0"
           fi
 
           {
@@ -116,18 +157,29 @@ jobs:
             echo ""
             echo "**Image:** \`$IMAGE_TAG\`"
             echo "**Wiz Policy:** \`Zee-Container-Security\`"
-            echo "**Wiz Filter:** 💥 Public Exploit + Has Fix"
             echo ""
-            echo "> Prisma shows all findings. Wiz shows only CVEs with a **public exploit AND a fix available**."
-            echo "> Wiz scanned $W_ALL total CVEs; $W_TOTAL have a public exploit."
+            echo "## Wiz Noise Reduction (Progressive Filtering)"
             echo ""
-            echo "| Severity | Prisma (all) | Wiz (💥 exploit only) |"
+            echo "| Filter Stage | CVEs | Reduction |"
+            echo "|---|---:|---:|"
+            echo "| Raw Wiz scan (all) | $W_RAW | — |"
+            echo "| osPackages + libraries only | $W_CSLIB | −$((W_RAW - W_CSLIB)) |"
+            echo "| + Public exploit (\`hasExploit\`) | $W_CSLIB_EXP | −$((W_CSLIB - W_CSLIB_EXP)) |"
+            echo "| + Fix available (\`fixedVersion\`) | $W_CSLIB_EXP_FIX | −$((W_CSLIB_EXP - W_CSLIB_EXP_FIX)) |"
+            echo "| **Noise removed** | **$REMOVED** | **${PCT}%** |"
+            echo ""
+            echo "## Final Comparison"
+            echo ""
+            echo "| Severity | Prisma Cloud (all) | Wiz (filtered) |"
             echo "|---|---:|---:|"
             echo "| 🔴 Critical | $P_CRIT | $W_CRIT |"
             echo "| 🟠 High | $P_HIGH | $W_HIGH |"
             echo "| 🟡 Medium | $P_MED | $W_MED |"
             echo "| 🟢 Low | $P_LOW | $W_LOW |"
             echo "| **Total** | **$P_TOTAL** | **$W_TOTAL** |"
+            echo ""
+            echo "> **Wiz filters applied:** osPackages + libraries only → hasExploit=true → fixedVersion available"
+            echo "> **Wiz breakdown:** OS Packages: $W_OS | Libraries: $W_LIB"
             echo ""
             echo "---"
             echo "_Run: $(date -u '+%Y-%m-%d %H:%M UTC')_"
