@@ -62,7 +62,6 @@ jobs:
           sudo -E /tmp/wizcli docker scan \
             --image "$IMAGE_TAG" \
             --policies "Zee-Container-Security" \
-            --policy-hits-only \
             --output wiz_results.json,json,vulnerabilities || true
 
           sudo chown runner:runner wiz_results.json 2>/dev/null || true
@@ -71,11 +70,22 @@ jobs:
           import json
           d = json.load(open('wiz_results.json'))
           result = d.get('result', {})
-          vulns = []
+
+          # Collect ALL vulns and also track which ones failed the policy
+          all_vulns = []
+          policy_failed = []
           for pkg_type in ['osPackages','libraries','applications','cpes','endOfLifeTechnologies']:
               for pkg in (result.get(pkg_type, []) or []):
                   for v in (pkg.get('vulnerabilities', []) or []):
-                      vulns.append(v)
+                      all_vulns.append(v)
+                      # A vuln has failedPolicyMatches when it violated the policy
+                      if v.get('failedPolicyMatches'):
+                          policy_failed.append(v)
+
+          # Use policy-failed vulns (matches what Wiz UI shows as "Failed")
+          # Falls back to all vulns if no policy matches found
+          vulns = policy_failed if policy_failed else all_vulns
+          tag = "policy-failed" if policy_failed else "all"
           sevs = {}
           for v in vulns:
               s = v.get('severity','UNKNOWN').upper()
@@ -83,6 +93,8 @@ jobs:
           print(f"TOTAL={len(vulns)}")
           for s in ['CRITICAL','HIGH','MEDIUM','LOW']:
               print(f"{s}={sevs.get(s,0)}")
+          print(f"ALL_TOTAL={len(all_vulns)}")
+          print(f"SOURCE={tag}")
           PY
 
       # ── COMPARISON ────────────────────────────────────────────────────────
@@ -96,10 +108,10 @@ jobs:
             done < /tmp/prisma_stats.txt
           fi
 
-          W_TOTAL="N/A"; W_CRIT=0; W_HIGH=0; W_MED=0; W_LOW=0
+          W_TOTAL="N/A"; W_CRIT=0; W_HIGH=0; W_MED=0; W_LOW=0; W_ALL=0; W_SRC="all"
           if [ -f /tmp/wiz_stats.txt ]; then
             while IFS='=' read -r k v; do
-              case "$k" in TOTAL) W_TOTAL=$v;; CRITICAL) W_CRIT=$v;; HIGH) W_HIGH=$v;; MEDIUM) W_MED=$v;; LOW) W_LOW=$v;; esac
+              case "$k" in TOTAL) W_TOTAL=$v;; CRITICAL) W_CRIT=$v;; HIGH) W_HIGH=$v;; MEDIUM) W_MED=$v;; LOW) W_LOW=$v;; ALL_TOTAL) W_ALL=$v;; SOURCE) W_SRC=$v;; esac
             done < /tmp/wiz_stats.txt
           fi
 
@@ -107,11 +119,14 @@ jobs:
             echo "# Prisma vs Wiz — Container Scan Comparison"
             echo ""
             echo "**Image:** \`$IMAGE_TAG\`"
-            echo "**Wiz Policy:** \`Zee-Container-Security\` (ignore unfixed CVEs)"
+            echo "**Wiz Policy:** \`Zee-Container-Security\` (Severity: Critical, Ignore unfixed)"
             echo ""
-            echo "## Vulnerability Counts"
+            echo "## Policy-Failed Vulnerabilities (Apples-to-Apples)"
             echo ""
-            echo "| Severity | Prisma Cloud | Wiz |"
+            echo "> Wiz column shows only CVEs that **failed** the \`Zee-Container-Security\` policy."
+            echo "> Wiz scanned $W_ALL total CVEs; $W_TOTAL violated the policy."
+            echo ""
+            echo "| Severity | Prisma Cloud | Wiz (policy-failed) |"
             echo "|---|---:|---:|"
             echo "| 🔴 Critical | $P_CRIT | $W_CRIT |"
             echo "| 🟠 High | $P_HIGH | $W_HIGH |"
@@ -120,7 +135,7 @@ jobs:
             echo "| **Total** | **$P_TOTAL** | **$W_TOTAL** |"
             echo ""
             echo "---"
-            echo "_Run: $(date -u '+%Y-%m-%d %H:%M UTC')_"
+            echo "_Run: $(date -u '+%Y-%m-%d %H:%M UTC') | Wiz source: $W_SRC | Total scanned by Wiz: $W_ALL_"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Artifacts
